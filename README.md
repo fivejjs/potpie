@@ -6,10 +6,12 @@
 
 <br/>
 <p align="center">
-
+<a href="https://trendshift.io/repositories/12918" target="_blank"><img src="https://trendshift.io/api/badge/repositories/12918" alt="potpie-ai%2Fpotpie | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+</br>
   <br />
   <a href="https://app.potpie.ai" rel="dofollow">App</a> | <a href="https://docs.potpie.ai" rel="dofollow">Documentation</a> | <a href="https://docs.potpie.ai/open-source"  rel="dofollow">API Reference</a> | <a href="https://app.potpie.ai/newchat?repo=potpie-ai/potpie&branch=main" rel="dofollow">Chat with 🥧 Repo</a>
   <br />
+
   </p>
 
 <p align="center">
@@ -21,7 +23,10 @@
   <a href="https://github.com/potpie-ai/potpie">
     <img src="https://img.shields.io/github/stars/potpie-ai/potpie" alt="GitHub Repo stars">
   </a>
+
 </br>
+
+
 <a href="https://discord.gg/ryk5CMD5v6">
     <img src="https://img.shields.io/badge/Join%20our-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join our Discord">
 </a>
@@ -64,6 +69,14 @@ Potpie is an open-source platform that creates AI agents specialized in your cod
 - 🔄 **Seamless Integration**: Works with your existing development workflow
 - 📈 **Flexible**: Handles codebases of any size or language
 
+
+## 🔌 VSCode Extension
+
+Bring the power of Potpie's AI agents directly into your development environment with our VSCode extension:
+
+- **Direct Integration**: Access all Potpie agents without leaving your editor
+- **Quick Setup**: Install directly from the [VSCode Marketplace](https://marketplace.visualstudio.com/items?itemName=PotpieAI.potpie-vscode-extension)
+- **Seamless Workflow**: Ask questions, get explanations, and implement suggestions right where you code
 
 
 ## 🤖 Potpie's Prebuilt Agents
@@ -252,17 +265,22 @@ You can access Potpie Agents through an API key, enabling integration into CI/CD
 
 Potpie is designed to be flexible and customizable. Here are key areas to personalize your own deployment:
 
-### 1. System Prompts Configuration
-Modify prompts in `app/modules/intelligence/prompts/system_prompt_setup.py`
+### **Effortless Agent Creation**:
+Design custom agents tailored to your specific tasks using a single prompt. Utilize the following API to create your custom agents:
+  
+  ```bash
+  curl -X POST "http://localhost:8001/api/v1/custom-agents/agents/auto" \
+       -H "Content-Type: application/json" \
+       -d '{
+             "prompt": "Aan agent that takes stacktrace as input and gives root cause analysis and proposed solution as output"
+           }'
+  ```
 
-### 2. Add New Agents
-Create new agents in `app/modules/intelligence/agents/chat_agents` and `app/modules/intelligence/agents/agentic_tools`
+  Read more about other custom agent APIs to edit and delete your custom agents in our [documentation](https://docs.potpie.ai/open-source/agents/create-agent-from-prompt).
 
-### 3. Agent Behavior Customization
-Modify guidelines within each agent's prompt in the `app/modules/intelligence/agents` directory
-
-### 4. Tool Integration
-Edit or add tools in the `app/modules/intelligence/tools` directory
+### Tool Integration
+Edit or add tools in the `app/modules/intelligence/tools` directory for your custom agents.
+Initialise the tools in the  `app/modules/intelligence/tools/tool_service.py` file and include them in your agent. 
 
 ## 🤝 Contributing
 

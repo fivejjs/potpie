@@ -1,4 +1,5 @@
-from typing import List
+import json
+from typing import Any, AsyncGenerator, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -28,6 +29,11 @@ from .conversation.conversation_schema import (
 from .message.message_schema import MessageRequest, MessageResponse, RegenerateRequest
 
 router = APIRouter()
+
+
+async def get_stream(data_stream: AsyncGenerator[Any, None]):
+    async for chunk in data_stream:
+        yield json.dumps(chunk.dict())
 
 
 class ConversationAPI:
@@ -98,13 +104,13 @@ class ConversationAPI:
         controller = ConversationController(db, user_id, user_email)
         message_stream = controller.post_message(conversation_id, message, stream)
         if stream:
-            return StreamingResponse(message_stream, media_type="text/event-stream")
+            return StreamingResponse(
+                get_stream(message_stream), media_type="text/event-stream"
+            )
         else:
-            # Collect all chunks into a complete response
-            full_response = ""
+            # TODO: fix this, add types. In below stream we have only one output.
             async for chunk in message_stream:
-                full_response += chunk
-            return {"content": full_response}
+                return chunk
 
     @staticmethod
     @router.post(
@@ -124,13 +130,12 @@ class ConversationAPI:
             conversation_id, request.node_ids, stream
         )
         if stream:
-            return StreamingResponse(message_stream, media_type="text/event-stream")
+            return StreamingResponse(
+                get_stream(message_stream), media_type="text/event-stream"
+            )
         else:
-            # Collect all chunks into a complete response
-            full_response = ""
             async for chunk in message_stream:
-                full_response += chunk
-            return {"content": full_response}
+                return chunk
 
     @staticmethod
     @router.delete("/conversations/{conversation_id}/", response_model=dict)

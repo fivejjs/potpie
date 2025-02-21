@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict, List, Optional, TypedDict
@@ -18,6 +19,7 @@ from app.modules.conversations.conversation.conversation_model import (
     Visibility,
 )
 from app.modules.conversations.conversation.conversation_schema import (
+    ChatMessageResponse,
     ConversationAccessType,
     ConversationInfoResponse,
     CreateConversationRequest,
@@ -35,8 +37,9 @@ from app.modules.conversations.message.message_schema import (
 from app.modules.intelligence.agents.agent_factory import AgentFactory
 from app.modules.intelligence.agents.agent_injector_service import AgentInjectorService
 from app.modules.intelligence.agents.agents_service import AgentsService
+from app.modules.intelligence.agents.custom_agents.custom_agent import CustomAgent
 from app.modules.intelligence.agents.custom_agents.custom_agents_service import (
-    CustomAgentsService,
+    CustomAgentService,
 )
 from app.modules.intelligence.memory.chat_history_service import ChatHistoryService
 from app.modules.intelligence.provider.provider_service import (
@@ -74,23 +77,18 @@ class SimplifiedAgentSupervisor:
     def __init__(self, db, provider_service):
         self.db = db
         self.provider_service = provider_service
-        self.agents = {}
+        self.agent = None
+        self.current_agent_id = None
         self.classifier = None
         self.agents_service = AgentsService(db)
         self.agent_factory = AgentFactory(db, provider_service)
         self.available_agents = []
 
     async def initialize(self, user_id: str):
-        available_agents = await self.agents_service.list_available_agents(
+        self.available_agents = await self.agents_service.list_available_agents(
             current_user={"user_id": user_id}, list_system_agents=True
         )
-        self.available_agents = available_agents
-        self.agents = {
-            agent.id: self.agent_factory.get_agent(agent.id, user_id)
-            for agent in available_agents
-        }
         self.llm = self.provider_service.get_small_llm(user_id)
-
         self.classifier_prompt = """
         Given the user query and the current agent ID, select the most appropriate agent by comparing the query’s requirements with each agent’s specialties.
 
@@ -134,8 +132,12 @@ class SimplifiedAgentSupervisor:
         - Overlapping domains, choose more specialized: `choose_higher_expertise_agent|0.80`
         """
 
+        # We'll only use system agents in classifier
+        system_agents = [
+            agent for agent in self.available_agents if agent.status == "SYSTEM"
+        ]
         self.agent_descriptions = "\n".join(
-            [f"- {agent.id}: {agent.description}" for agent in available_agents]
+            [f"- {agent.id}: {agent.description}" for agent in system_agents]
         )
 
     class State(TypedDict):
@@ -151,18 +153,29 @@ class SimplifiedAgentSupervisor:
         """Classifies the query and routes to appropriate agent"""
         if not state.get("query"):
             return Command(update={"response": "No query provided"}, goto=END)
+
         agent_list = {agent.id: agent.status for agent in self.available_agents}
 
-        # Do not route for custom agents
+        # First check - if this is a custom agent (non-SYSTEM), route directly
         if (
             state["agent_id"] in agent_list
             and agent_list[state["agent_id"]] != "SYSTEM"
         ):
-            return Command(
-                update={"agent_id": state["agent_id"]}, goto=state["agent_id"]
-            )
+            # Initialize the agent if needed
+            if not self.agent or self.current_agent_id != state["agent_id"]:
+                try:
+                    self.agent = self.agent_factory.get_agent(
+                        state["agent_id"], state["user_id"]
+                    )
+                    self.current_agent_id = state["agent_id"]
+                except Exception as e:
+                    logger.error(f"Failed to create agent {state['agent_id']}: {e}")
+                    return Command(
+                        update={"response": "Failed to initialize agent"}, goto=END
+                    )
+            return Command(update={"agent_id": state["agent_id"]}, goto="agent_node")
 
-        # Classification using LLM with enhanced prompt
+        # For system agents, perform classification
         prompt = self.classifier_prompt.format(
             query=state["query"],
             agent_id=state["agent_id"],
@@ -174,46 +187,79 @@ class SimplifiedAgentSupervisor:
         try:
             agent_id, confidence = response.split("|")
             confidence = float(confidence)
+            selected_agent_id = (
+                agent_id
+                if confidence >= 0.5 and agent_id in agent_list
+                else state["agent_id"]
+            )
         except (ValueError, TypeError):
-            return Command(
-                update={"response": "Error in classification format"}, goto=END
-            )
-        if confidence < 0.5 or agent_id not in self.agents:
-            logger.info(
-                f"Streaming AI response for conversation {state['conversation_id']} for user {state['user_id']} using agent {agent_id}"
-            )
-            return Command(
-                update={"agent_id": state["agent_id"]}, goto=state["agent_id"]
-            )
+            logger.error("Classification format error, falling back to current agent")
+            selected_agent_id = state["agent_id"]
+
+        # Initialize the selected system agent
+        if not self.agent or self.current_agent_id != selected_agent_id:
+            try:
+                self.agent = self.agent_factory.get_agent(
+                    selected_agent_id, state["user_id"]
+                )
+                self.current_agent_id = selected_agent_id
+            except Exception as e:
+                logger.error(f"Failed to create agent {selected_agent_id}: {e}")
+                return Command(
+                    update={"response": "Failed to initialize agent"}, goto=END
+                )
+
         logger.info(
-            f"Streaming AI response for conversation {state['conversation_id']} for user {state['user_id']} using agent {agent_id}"
+            f"Streaming AI response for conversation {state['conversation_id']} "
+            f"for user {state['user_id']} using agent {selected_agent_id}"
         )
-        return Command(update={"agent_id": agent_id}, goto=agent_id)
+        return Command(update={"agent_id": selected_agent_id}, goto="agent_node")
 
     async def agent_node(self, state: State, writer: StreamWriter):
-        """Creates a node function for a specific agent"""
-        agent = self.agents[state["agent_id"]]
-        async for chunk in agent.run(
-            query=state["query"],
-            project_id=state["project_id"],
-            conversation_id=state["conversation_id"],
-            user_id=state["user_id"],
-            node_ids=state["node_ids"],
-        ):
-            if isinstance(chunk, str):
-                writer(chunk)
+        """Single agent node that uses the created agent"""
+        if not self.agent:
+            logger.error("Agent not initialized before agent_node execution")
+            return Command(update={"response": "Agent not initialized"}, goto=END)
+
+        try:
+            system_agents = [
+            agent.id for agent in self.available_agents if agent.status == "SYSTEM"
+        ]
+            if state["agent_id"] in system_agents:
+                async for chunk in self.agent.run(
+                    query=state["query"],
+                    project_id=state["project_id"],
+                    conversation_id=state["conversation_id"],
+                    user_id=state["user_id"],
+                    node_ids=state["node_ids"],
+                ):
+                    if isinstance(chunk, str):
+                        writer(chunk)   
+            else:
+                async for chunk in await self.agent.run(
+                    query=state["query"],
+                    project_id=state["project_id"],
+                    conversation_id=state["conversation_id"],
+                    user_id=state["user_id"],
+                    agent_id=state["agent_id"],
+                    node_ids=state["node_ids"],
+                ):
+                    if isinstance(chunk, str):
+                        writer(chunk)
+        except Exception as e:
+            logger.error(f"Error in agent execution: {e}")
+            writer("An error occurred while processing your request")
 
     def build_graph(self) -> StateGraph:
-        """Builds the graph with classifier and agent nodes"""
+        """Builds simplified graph with classifier and single agent node"""
         builder = StateGraph(self.State)
 
         # Add classifier as entry point
         builder.add_node("classifier", self.classifier_node)
 
-        # Add agent nodes
-        for agent_id in self.agents:
-            builder.add_node(agent_id, self.agent_node)
-            builder.add_edge(agent_id, END)
+        # Add single agent node
+        builder.add_node("agent_node", self.agent_node)
+        builder.add_edge("agent_node", END)
 
         builder.set_entry_point("classifier")
         return builder.compile()
@@ -253,7 +299,7 @@ class ConversationService:
         history_manager: ChatHistoryService,
         provider_service: ProviderService,
         agent_injector_service: AgentInjectorService,
-        custom_agent_service: CustomAgentsService,
+        custom_agent_service: CustomAgentService,
     ):
         self.sql_db = db
         self.user_id = user_id
@@ -270,7 +316,7 @@ class ConversationService:
         history_manager = ChatHistoryService(db)
         provider_service = ProviderService(db, user_id)
         agent_injector_service = AgentInjectorService(db, provider_service, user_id)
-        custom_agent_service = CustomAgentsService()
+        custom_agent_service = CustomAgentService(db)
         return cls(
             db,
             user_id,
@@ -323,7 +369,7 @@ class ConversationService:
         self, conversation: CreateConversationRequest, user_id: str
     ) -> tuple[str, str]:
         try:
-            if not self.agent_injector_service.validate_agent_id(
+            if not await self.agent_injector_service.validate_agent_id(
                 user_id, conversation.agent_ids[0]
             ):
                 raise ConversationServiceError(
@@ -427,7 +473,7 @@ class ConversationService:
         message_type: MessageType,
         user_id: str,
         stream: bool = True,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[ChatMessageResponse, None]:
         try:
             access_level = await self.check_conversation_access(
                 conversation_id, self.user_email
@@ -478,12 +524,15 @@ class ConversationService:
                     ):
                         yield chunk
                 else:
-                    # For non-streaming, collect all chunks and store as a single message
-                    full_response = ""
+                    full_message = ""
+                    all_citations = []
                     async for chunk in self._generate_and_stream_ai_response(
                         message.content, conversation_id, user_id, message.node_ids
                     ):
-                        full_response += chunk
+                        full_message += chunk.message
+                        all_citations = all_citations + chunk.citations
+
+                    # TODO: what is this below comment for?
                     # # Store the complete response as a single message
                     # self.history_manager.add_message_chunk(
                     #     conversation_id, full_response, MessageType.AI, user_id
@@ -491,7 +540,9 @@ class ConversationService:
                     # self.history_manager.flush_message_buffer(
                     #     conversation_id, MessageType.AI, user_id
                     # )
-                    yield full_response
+                    yield ChatMessageResponse(
+                        message=full_message, citations=all_citations
+                    )
 
         except AccessTypeReadError:
             raise
@@ -560,7 +611,7 @@ class ConversationService:
         user_id: str,
         node_ids: List[NodeContext] = [],
         stream: bool = True,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[ChatMessageResponse, None]:
         try:
             access_level = await self.check_conversation_access(
                 conversation_id, self.user_email
@@ -586,12 +637,14 @@ class ConversationService:
                 ):
                     yield chunk
             else:
-                # For non-streaming, collect all chunks and store as a single message
-                full_response = ""
+                full_message = ""
+                all_citations = []
+
                 async for chunk in self._generate_and_stream_ai_response(
                     last_human_message.content, conversation_id, user_id, node_ids
                 ):
-                    full_response += chunk
+                    full_message += chunk.message
+                    all_citations = all_citations + chunk.citations
                 # # Store the complete response as a single message
                 # self.history_manager.add_message_chunk(
                 #     conversation_id, full_response, MessageType.AI, user_id
@@ -599,7 +652,7 @@ class ConversationService:
                 # self.history_manager.flush_message_buffer(
                 #     conversation_id, MessageType.AI, user_id
                 # )
-                yield full_response
+                yield ChatMessageResponse(message=full_message, citations=all_citations)
 
         except AccessTypeReadError:
             raise
@@ -650,13 +703,26 @@ class ConversationService:
                 "Failed to archive subsequent messages."
             ) from e
 
+    def parse_str_to_message(self, chunk: str) -> ChatMessageResponse:
+        try:
+            data = json.loads(chunk)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse chunk as JSON: {e}")
+            raise ConversationServiceError("Failed to parse AI response") from e
+
+        # Extract the 'message' and 'citations'
+        message: str = data.get("message", "")
+        citations: List[str] = data.get("citations", [])
+
+        return ChatMessageResponse(message=message, citations=citations)
+
     async def _generate_and_stream_ai_response(
         self,
         query: str,
         conversation_id: str,
         user_id: str,
         node_ids: List[NodeContext],
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[ChatMessageResponse, None]:
         conversation = (
             self.sql_db.query(Conversation).filter_by(id=conversation_id).first()
         )
@@ -670,24 +736,24 @@ class ConversationService:
         supervisor = SimplifiedAgentSupervisor(self.sql_db, self.provider_service)
         await supervisor.initialize(user_id)
         try:
-            agent = self.agent_injector_service.get_agent(agent_id)
+            agent = await self.agent_injector_service.get_agent(agent_id)
 
             logger.info(
                 f"conversation_id: {conversation_id} Running agent {agent_id} with query: {query}"
             )
 
-            if isinstance(agent, CustomAgentsService):
+            if isinstance(agent, CustomAgent):
                 # Custom agent doesn't support streaming, so we'll yield the entire response at once
-                response = await agent.run(
-                    agent_id, query, project_id, user_id, conversation.id, node_ids
+                response = await CustomAgentService(self.sql_db).execute_agent_runtime(
+                    agent_id, user_id, query, node_ids, project_id, conversation.id
                 )
-                yield response
+                yield ChatMessageResponse(message=response["message"], citations=[])
             else:
                 # For other agents that support streaming
                 async for chunk in supervisor.process_query(
                     query, project_id, conversation.id, user_id, node_ids, agent_id
                 ):
-                    yield chunk
+                    yield self.parse_str_to_message(chunk)
 
             logger.info(
                 f"Generated and streamed AI response for conversation {conversation.id} for user {user_id} using agent {agent_id}"
